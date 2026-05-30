@@ -50,17 +50,6 @@
 #define COL_RED    0xF800
 #define COL_SEL    0x1249
 
-// ─── Audio buffer ────────────────────────────────────────────────────────────
-#define MP3_INBUF_SIZE  2048
-#define PCM_BUF_FRAMES  1152   // max frames por frame MP3
-
-static uint8_t  mp3InBuf[MP3_INBUF_SIZE];
-static int16_t  pcmBuf[PCM_BUF_FRAMES * 2];  // stereo
-static HMP3Decoder hMP3 = nullptr;
-static File     mp3File;
-static int      inBufFill  = 0;
-static int      inBufOffset = 0;
-
 // ─── Track ───────────────────────────────────────────────────────────────────
 struct Track {
   String filename;
@@ -68,6 +57,39 @@ struct Track {
   String artist;
   String album;
 };
+
+// ─── Audio buffer ────────────────────────────────────────────────────────────
+#define MP3_INBUF_SIZE  4096               // más grande = menos rellenos desde SD
+#define PCM_BUF_FRAMES  1152               // max samples por frame MP3
+#define MONO_BUF_SIZE   PCM_BUF_FRAMES     // buffer mono procesado
+
+static uint8_t  mp3InBuf[MP3_INBUF_SIZE];
+static int16_t  pcmBuf[PCM_BUF_FRAMES * 2];   // stereo crudo del decoder
+static int16_t  monoBuf[MONO_BUF_SIZE];        // mono procesado para el speaker
+static HMP3Decoder hMP3 = nullptr;
+static File     mp3File;
+static int      inBufFill   = 0;
+static int      inBufOffset = 0;
+
+// ─── DSP: EQ biquad peaking +4dB @ 3kHz ─────────────────────────────────────
+static float eq_b0 =  1.0985f;
+static float eq_b1 = -1.6782f;
+static float eq_b2 =  0.6218f;
+static float eq_a1 = -1.6782f;
+static float eq_a2 =  0.7203f;
+static float eq_x1 = 0, eq_x2 = 0;
+static float eq_y1 = 0, eq_y2 = 0;
+
+inline int16_t applyEQ(int16_t x) {
+  float xf = (float)x;
+  float y = eq_b0*xf + eq_b1*eq_x1 + eq_b2*eq_x2
+                     - eq_a1*eq_y1  - eq_a2*eq_y2;
+  eq_x2 = eq_x1; eq_x1 = xf;
+  eq_y2 = eq_y1; eq_y1 = y;
+  if (y >  32767.f) y =  32767.f;
+  if (y < -32768.f) y = -32768.f;
+  return (int16_t)y;
+}
 
 // ─── Estado ──────────────────────────────────────────────────────────────────
 std::vector<Track> playlist;
@@ -201,18 +223,29 @@ bool decodeFrame() {
 
   MP3GetLastFrameInfo(hMP3, &info);
 
-  // Mandar muestras al Speaker M5Unified
-  // playRaw espera: buffer, nSamples, sampleRate, stereo, repeat, channel
-  int nSamples = info.outputSamps;
-  bool stereo  = (info.nChans == 2);
-
-  // Ajustar volumen via software
   float gain = (float)volume / (float)VOL_MAX;
-  for (int i = 0; i < nSamples; i++) {
-    pcmBuf[i] = (int16_t)(pcmBuf[i] * gain);
-  }
+  int nFrames = info.outputSamps / info.nChans;  // frames de audio (L+R = 1 frame)
+  int monoCount = 0;
 
-  M5Cardputer.Speaker.playRaw(pcmBuf, nSamples, info.samprate, stereo, 1, 0);
+  bool srcStereo = (info.nChans == 2);
+
+  if (srcStereo) {
+    // Stereo: aplicar EQ y volumen a cada canal por separado
+    // Usar pcmBuf directamente (L,R intercalados)
+    for (int i = 0; i < nFrames * 2; i++) {
+      int16_t s = applyEQ(pcmBuf[i]);
+      pcmBuf[i] = (int16_t)(s * gain);
+    }
+    // Mandar stereo — sale stereo por el jack 3.5mm, M5Unified mezcla a mono en el speaker interno
+    M5Cardputer.Speaker.playRaw(pcmBuf, nFrames * 2, info.samprate, true, 1, 0);
+  } else {
+    // Mono: EQ y volumen
+    for (int i = 0; i < nFrames; i++) {
+      int16_t s = applyEQ(pcmBuf[i]);
+      monoBuf[monoCount++] = (int16_t)(s * gain);
+    }
+    M5Cardputer.Speaker.playRaw(monoBuf, monoCount, info.samprate, false, 1, 0);
+  }
 
   return true;
 }
@@ -236,6 +269,9 @@ void startTrack(int idx) {
 
   hMP3 = MP3InitDecoder();
   if (!hMP3) { mp3File.close(); return; }
+
+  // Reset estado del filtro EQ
+  eq_x1=0; eq_x2=0; eq_y1=0; eq_y2=0;
 
   // Saltar tag ID3 si existe
   uint8_t hdr[10];
